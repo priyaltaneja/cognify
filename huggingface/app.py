@@ -67,7 +67,7 @@ def load_model():
     return model
 
 def parse_nifti(file_bytes: bytes, filename: str = "temp.nii"):
-    """Parse NIfTI file from bytes"""
+    """Parse NIfTI file from bytes and reorient to canonical (RAS+) orientation"""
     import tempfile
 
     # Determine file extension for nibabel
@@ -81,8 +81,16 @@ def parse_nifti(file_bytes: bytes, filename: str = "temp.nii"):
 
     try:
         img = nib.load(tmp_path)
-        data = img.get_fdata()
-        header = img.header
+
+        # Reorient to canonical RAS+ orientation (like NiiVue does)
+        # This ensures consistent orientation regardless of how the file was saved
+        img_canonical = nib.as_closest_canonical(img)
+        data = img_canonical.get_fdata()
+        header = img_canonical.header
+
+        print(f"Original orientation: {nib.aff2axcodes(img.affine)}")
+        print(f"Canonical orientation: {nib.aff2axcodes(img_canonical.affine)}")
+
     finally:
         # Clean up temp file
         import os
@@ -166,8 +174,12 @@ def preprocess_volume(data, header):
     # Ensure float32
     data = data.astype(np.float32)
 
-    # Transpose to match model expectations (the model was trained with this orientation)
+    # The model expects input in a specific orientation
+    # After canonical reorientation, data is in RAS+ (Right-Anterior-Superior)
+    # The tfjs model was trained with transposed input, so we transpose here
+    # This matches the local frontend's behavior
     data = np.transpose(data, (2, 1, 0))
+    print(f"After transpose shape: {data.shape}")
 
     # Add batch and channel dimensions
     data = np.expand_dims(data, axis=0)  # batch
@@ -178,10 +190,10 @@ def preprocess_volume(data, header):
 
 def postprocess_segmentation(segmentation):
     """
-    Transpose segmentation back to standard orientation.
+    Transpose segmentation back to standard RAS+ orientation.
     Output is 256^3 (conformed space).
     """
-    # Transpose back
+    # Transpose back to RAS+ orientation
     segmentation = np.transpose(segmentation, (2, 1, 0))
     return segmentation
 
@@ -336,6 +348,94 @@ async def segment_compact(file: UploadFile = File(...)):
         print(f"ERROR in /segment/compact: {str(e)}")
         traceback.print_exc()
         raise HTTPException(500, f"Segmentation failed: {str(e)}")
+
+
+@app.post("/segment/tensor")
+async def segment_tensor(file: UploadFile = File(...)):
+    """
+    Segment using pre-processed tensor from frontend.
+
+    Accepts gzipped raw tensor data (256x256x256 uint8) that has already been
+    conformed by NiiVue. This ensures identical preprocessing to local inference.
+
+    The frontend sends the conformed volume, server just runs inference.
+    """
+    import base64
+
+    try:
+        start_time = time.time()
+
+        # Read gzipped tensor data
+        compressed_bytes = await file.read()
+        print(f"Received {len(compressed_bytes)} bytes of compressed tensor data")
+
+        # Decompress
+        try:
+            raw_bytes = gzip.decompress(compressed_bytes)
+        except:
+            # Maybe not compressed
+            raw_bytes = compressed_bytes
+
+        expected_size = 256 * 256 * 256
+        if len(raw_bytes) != expected_size:
+            raise HTTPException(400, f"Expected {expected_size} bytes (256³), got {len(raw_bytes)}")
+
+        # Convert to numpy array
+        data = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((256, 256, 256))
+        print(f"Tensor shape: {data.shape}, dtype: {data.dtype}")
+
+        # Normalize to [0, 1] - same as brainchop's minMaxNormalizeVolumeData
+        data = data.astype(np.float32)
+        data_min = data.min()
+        data_max = data.max()
+        if data_max - data_min > 0:
+            data = (data - data_min) / (data_max - data_min)
+        print(f"Normalized range: [{data.min():.3f}, {data.max():.3f}]")
+
+        # Transpose - same as brainchop with enableTranspose=true
+        data = np.transpose(data, (2, 1, 0))
+        print(f"After transpose: {data.shape}")
+
+        # Add batch and channel dimensions
+        data = np.expand_dims(data, axis=0)   # batch
+        data = np.expand_dims(data, axis=-1)  # channel
+        print(f"Model input shape: {data.shape}")
+
+        # Run inference
+        inference_start = time.time()
+        loaded_model = load_model()
+        prediction = loaded_model.predict(data, verbose=0)
+        segmentation = np.argmax(prediction, axis=-1)[0]
+
+        # Transpose back to match frontend expectations
+        segmentation = np.transpose(segmentation, (2, 1, 0))
+        inference_time = time.time() - inference_start
+        print(f"Inference time: {inference_time:.2f}s, output shape: {segmentation.shape}")
+
+        total_time = time.time() - start_time
+
+        # Compress and encode result
+        seg_bytes = segmentation.astype(np.uint8).tobytes()
+        compressed = gzip.compress(seg_bytes)
+        encoded = base64.b64encode(compressed).decode('utf-8')
+
+        return JSONResponse({
+            "success": True,
+            "shape": list(segmentation.shape),
+            "dtype": "uint8",
+            "encoding": "base64_gzip",
+            "inference_time": round(inference_time, 3),
+            "total_time": round(total_time, 3),
+            "data": encoded
+        })
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"ERROR in /segment/tensor: {str(e)}")
+        traceback.print_exc()
+        raise HTTPException(500, f"Tensor inference failed: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn

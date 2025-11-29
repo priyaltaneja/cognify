@@ -30,39 +30,61 @@ import { isChrome } from "../brainchop-diagnostics.js";
 // ============================================
 // SERVER-SIDE INFERENCE CONFIGURATION
 // Set USE_SERVER = true to use HuggingFace GPU server
-// Set your HuggingFace Space URL below after deployment
+// The server uses /segment/tensor endpoint which receives pre-processed
+// tensor data from NiiVue, ensuring identical results to local inference.
 // ============================================
-const USE_SERVER = true;  // Toggle this to enable server-side inference
-const SERVER_URL = "https://aryagm-shia-brain.hf.space";  // Update after deploying
+const USE_SERVER = true;  // Enable for GPU acceleration on weak devices
+const SERVER_URL = "https://aryagm-shia-brain.hf.space";
 
 /**
  * Run inference on the server (HuggingFace Space with GPU)
  * Falls back to local inference if server is unavailable
+ *
+ * Uses the /segment/tensor endpoint which accepts pre-processed tensor data.
+ * This ensures identical preprocessing to local inference since NiiVue handles
+ * the conforming, and only the GPU inference is offloaded to the server.
  */
 async function runServerInference(progressCallback) {
-  if (!uploadedFile) {
-    throw new Error("No file uploaded");
+  if (!nv1 || !nv1.volumes || !nv1.volumes[0]) {
+    throw new Error("No volume loaded");
   }
 
-  progressCallback("Connecting to GPU server...", 0.05);
+  progressCallback("Preparing tensor for upload...", 0.05);
 
-  // Use the original uploaded file
+  // Get the conformed volume data from NiiVue
+  // After ensureConformed(), this is a 256³ Uint8Array
+  const tensorData = nv1.volumes[0].img;
+
+  if (!(tensorData instanceof Uint8Array) || tensorData.length !== 256 * 256 * 256) {
+    throw new Error(`Invalid tensor: expected 256³ Uint8Array, got ${tensorData.constructor.name} length ${tensorData.length}`);
+  }
+
+  console.log(`Tensor data: ${tensorData.length} bytes, range [${Math.min(...tensorData.slice(0, 1000))}-${Math.max(...tensorData.slice(0, 1000))}]`);
+
+  // Compress tensor with pako
+  progressCallback("Compressing tensor...", 0.1);
+  const compressed = pako.gzip(tensorData);
+  console.log(`Compressed: ${tensorData.length} -> ${compressed.length} bytes (${(compressed.length / tensorData.length * 100).toFixed(1)}%)`);
+
+  // Create blob for upload
+  const blob = new Blob([compressed], { type: 'application/octet-stream' });
   const formData = new FormData();
-  formData.append('file', uploadedFile);
+  formData.append('file', blob, 'tensor.gz');
 
   try {
-    progressCallback("Uploading scan to server...", 0.1);
+    progressCallback("Uploading to GPU server...", 0.2);
 
-    const response = await fetch(`${SERVER_URL}/segment/compact`, {
+    const response = await fetch(`${SERVER_URL}/segment/tensor`, {
       method: 'POST',
       body: formData,
     });
 
     if (!response.ok) {
-      throw new Error(`Server error: ${response.status}`);
+      const text = await response.text();
+      throw new Error(`Server error ${response.status}: ${text}`);
     }
 
-    progressCallback("Processing on GPU...", 0.3);
+    progressCallback("Processing on GPU...", 0.5);
 
     const result = await response.json();
 
@@ -79,10 +101,11 @@ async function runServerInference(progressCallback) {
       compressedBytes[i] = binaryString.charCodeAt(i);
     }
 
-    // Decompress using pako (included via CDN or import)
+    // Decompress using pako
     const decompressed = pako.ungzip(compressedBytes);
 
     progressCallback("Segmentation complete!", 1.0);
+    console.log(`Server inference completed in ${result.inference_time}s (total: ${result.total_time}s)`);
 
     return {
       segmentation: decompressed,
