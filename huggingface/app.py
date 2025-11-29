@@ -99,22 +99,75 @@ def min_max_normalize(data):
     return (data - data_min) / (data_max - data_min)
 
 def preprocess_volume(data):
-    """Preprocess MRI volume for model input"""
+    """
+    Preprocess MRI volume for model input.
+    Returns preprocessed data and info needed to unpad output.
+    """
+    original_shape = data.shape
+
     # Normalize
     data = min_max_normalize(data)
 
     # Ensure float32
     data = data.astype(np.float32)
 
-    # Transpose if needed (depends on model training)
-    # Model expects [batch, D, H, W, channels]
-    data = np.transpose(data, (2, 1, 0))  # Adjust axes as needed
+    # Transpose to match model expectations
+    data = np.transpose(data, (2, 1, 0))
+    transposed_shape = data.shape
+
+    # Pad to 256x256x256 if needed (model requires fixed input size)
+    target_shape = (256, 256, 256)
+    current_shape = data.shape
+    pad_info = None
+
+    if current_shape != target_shape:
+        print(f"Padding volume from {current_shape} to {target_shape}")
+        padded = np.zeros(target_shape, dtype=np.float32)
+
+        # Calculate padding offsets (center the volume)
+        offsets = [(t - c) // 2 for t, c in zip(target_shape, current_shape)]
+
+        # Handle cases where input is larger than target (crop instead)
+        slices_src = []
+        slices_dst = []
+        for i in range(3):
+            if current_shape[i] <= target_shape[i]:
+                # Pad: source is full, destination is offset
+                slices_src.append(slice(0, current_shape[i]))
+                slices_dst.append(slice(offsets[i], offsets[i] + current_shape[i]))
+            else:
+                # Crop: source is cropped, destination is full
+                start = (current_shape[i] - target_shape[i]) // 2
+                slices_src.append(slice(start, start + target_shape[i]))
+                slices_dst.append(slice(0, target_shape[i]))
+
+        padded[slices_dst[0], slices_dst[1], slices_dst[2]] = data[slices_src[0], slices_src[1], slices_src[2]]
+        data = padded
+        pad_info = {
+            'original_transposed_shape': transposed_shape,
+            'slices_dst': slices_dst
+        }
 
     # Add batch and channel dimensions
     data = np.expand_dims(data, axis=0)  # batch
     data = np.expand_dims(data, axis=-1)  # channel
 
-    return data
+    return data, pad_info, original_shape
+
+
+def postprocess_segmentation(segmentation, pad_info, original_shape):
+    """
+    Remove padding from segmentation output and transpose back to original orientation.
+    """
+    # If we padded, extract the original region
+    if pad_info is not None:
+        slices = pad_info['slices_dst']
+        segmentation = segmentation[slices[0], slices[1], slices[2]]
+
+    # Transpose back to original orientation
+    segmentation = np.transpose(segmentation, (2, 1, 0))
+
+    return segmentation
 
 def run_inference(data):
     """Run model inference on preprocessed data"""
@@ -177,13 +230,14 @@ async def segment(file: UploadFile = File(...)):
 
         # Preprocess
         preprocess_start = time.time()
-        processed = preprocess_volume(data)
+        processed, pad_info, original_shape = preprocess_volume(data)
         preprocess_time = time.time() - preprocess_start
         print(f"Preprocessed shape: {processed.shape}, Time: {preprocess_time:.2f}s")
 
         # Run inference
         inference_start = time.time()
         segmentation = run_inference(processed)
+        segmentation = postprocess_segmentation(segmentation, pad_info, original_shape)
         inference_time = time.time() - inference_start
         print(f"Inference time: {inference_time:.2f}s")
 
@@ -231,9 +285,19 @@ async def segment_compact(file: UploadFile = File(...)):
             raise HTTPException(400, "File must be a NIfTI file (.nii or .nii.gz)")
 
         file_bytes = await file.read()
+        print(f"Processing: {file.filename}, size: {len(file_bytes)} bytes")
+
         data, header = parse_nifti(file_bytes, file.filename)
-        processed = preprocess_volume(data)
+        print(f"Parsed volume shape: {data.shape}")
+
+        processed, pad_info, original_shape = preprocess_volume(data)
+        print(f"Preprocessed shape: {processed.shape}")
+
         segmentation = run_inference(processed)
+        print(f"Raw segmentation shape: {segmentation.shape}")
+
+        segmentation = postprocess_segmentation(segmentation, pad_info, original_shape)
+        print(f"Final segmentation shape: {segmentation.shape}")
 
         total_time = time.time() - start_time
 
