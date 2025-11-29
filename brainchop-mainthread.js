@@ -385,24 +385,70 @@ async function inferenceFullVolumePhase1(
   }
 }
 
-async function enableProductionMode(textureF16Flag = true) {
-  // -- tf.setBackend('cpu')
-  // -- tf.removeBackend('cpu')
+/**
+ * Detect if the device has limited GPU memory (Intel integrated graphics, etc.)
+ * Returns true if we should use CPU/WASM backend instead of WebGL
+ */
+function shouldUseCPUBackend() {
+  try {
+    const canvas = document.createElement('canvas')
+    const gl = canvas.getContext('webgl2') || canvas.getContext('webgl')
+    if (!gl) return true
+
+    const debugInfo = gl.getExtension('WEBGL_debug_renderer_info')
+    if (debugInfo) {
+      const renderer = gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL).toLowerCase()
+      const vendor = gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL).toLowerCase()
+
+      // Detect Intel integrated graphics (common on laptops)
+      const isIntelIntegrated = renderer.includes('intel') &&
+        (renderer.includes('uhd') || renderer.includes('iris') || renderer.includes('hd graphics'))
+
+      // Detect other low-memory GPUs
+      const isLowMemoryGPU = renderer.includes('mali') || renderer.includes('adreno') ||
+        renderer.includes('powervr') || renderer.includes('videocore')
+
+      if (isIntelIntegrated || isLowMemoryGPU) {
+        console.log(`Detected low-memory GPU: ${renderer}. Will use CPU backend for stability.`)
+        return true
+      }
+    }
+    return false
+  } catch (e) {
+    console.warn('Could not detect GPU capabilities:', e)
+    return false
+  }
+}
+
+async function enableProductionMode(textureF16Flag = true, forceCPU = false) {
+  // Check if we should use CPU backend for low-memory devices
+  const useCPU = forceCPU || shouldUseCPUBackend()
+
+  if (useCPU) {
+    console.log('Using CPU backend for better compatibility with limited GPU memory')
+    await tf.setBackend('cpu')
+  }
+
   // -- Calling enableProdMode() method
   await tf.enableProdMode()
   // -- Setting debug mode of the  environment
   tf.env().set('DEBUG', false)
-  tf.env().set('WEBGL_FORCE_F16_TEXTURES', textureF16Flag)
-  // -- set this flag so that textures are deleted when tensors are disposed.
-  tf.env().set('WEBGL_DELETE_TEXTURE_THRESHOLD', -1)
-  // -- tf.env().set('WEBGL_PACK', false)
+
+  if (!useCPU) {
+    tf.env().set('WEBGL_FORCE_F16_TEXTURES', textureF16Flag)
+    // -- set this flag so that textures are deleted when tensors are disposed.
+    tf.env().set('WEBGL_DELETE_TEXTURE_THRESHOLD', -1)
+  }
+
   // -- Put ready after sets above
   await tf.ready()
   // -- Printing output
   console.log('tf env() flags :', tf.env().flags)
   console.log('tf env() features :', tf.env().features)
   console.log('tf env total features: ', Object.keys(tf.env().features).length)
-  console.log(tf.getBackend())
+  console.log('Using backend:', tf.getBackend())
+
+  return tf.getBackend()
 }
 
 export async function runInference(opts, modelEntry, niftiHeader, niftiImage, callbackImg, callbackUI) {
@@ -426,8 +472,13 @@ export async function runInference(opts, modelEntry, niftiHeader, niftiImage, ca
   console.log('Batch size: ', batchSize)
   console.log('Num of Channels: ', numOfChan)
   const model = await load_model(opts.rootURL + modelEntry.path)
-  await enableProductionMode(true)
-  statData.TF_Backend = tf.getBackend()
+  const backend = await enableProductionMode(true)
+  statData.TF_Backend = backend
+
+  // Warn user if using CPU backend (will be slower)
+  if (backend === 'cpu') {
+    callbackUI('Using CPU mode for compatibility (slower but more stable)', 0)
+  }
   const modelObject = model
   let batchInputShape = []
   // free global variable of 16777216 voxel
