@@ -32,20 +32,23 @@ import { isChrome } from "../brainchop-diagnostics.js";
 // Set USE_SERVER = true to use HuggingFace GPU server
 // Set your HuggingFace Space URL below after deployment
 // ============================================
-const USE_SERVER = false;  // Toggle this to enable server-side inference
+const USE_SERVER = true;  // Toggle this to enable server-side inference
 const SERVER_URL = "https://aryagm-shia-brain.hf.space";  // Update after deploying
 
 /**
  * Run inference on the server (HuggingFace Space with GPU)
  * Falls back to local inference if server is unavailable
  */
-async function runServerInference(niftiHeader, niftiImage, progressCallback) {
+async function runServerInference(progressCallback) {
+  if (!uploadedFile) {
+    throw new Error("No file uploaded");
+  }
+
   progressCallback("Connecting to GPU server...", 0.05);
 
-  // Create NIfTI file blob from the raw data
-  const blob = new Blob([niftiImage], { type: 'application/octet-stream' });
+  // Use the original uploaded file
   const formData = new FormData();
-  formData.append('file', blob, 'brain.nii');
+  formData.append('file', uploadedFile);
 
   try {
     progressCallback("Uploading scan to server...", 0.1);
@@ -607,6 +610,7 @@ const CLINICAL_PATTERNS = {
 let nv1 = null;
 let segmentationData = null;
 let regionVolumes = null;
+let uploadedFile = null;  // Store original file for server-side inference
 let analysisResults = null;
 
 // Default model: Subcortical + GWM - robust for low quality MRIs
@@ -715,6 +719,7 @@ async function loadFile(file) {
     segmentationData = null;
     regionVolumes = null;
     analysisResults = null;
+    uploadedFile = file;  // Store for server-side inference
     hideAnalysisCards();
 
     // Load file
@@ -806,8 +811,6 @@ async function runSegmentation() {
   if (USE_SERVER) {
     try {
       const result = await runServerInference(
-        nv1.volumes[0].hdr,
-        nv1.volumes[0].img,
         (message, progress) => {
           const adjustedProgress = 10 + progress * 55;
           updateProgress(adjustedProgress, message);
