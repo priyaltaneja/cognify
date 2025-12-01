@@ -91,4 +91,4 @@ MIT License - See [LICENSE](LICENSE) for details.
 
 ---
 
-*S.H.I.A - Advancing early detection of Alzheimer's disease through AI-powered neuroimaging analysis.*
+*Cognify - Advancing early detection of Alzheimer's disease through AI-powered neuroimaging analysis.*
